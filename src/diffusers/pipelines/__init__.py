@@ -49,6 +49,7 @@ else:
         CycleDiffusionPipeline,
         StableDiffusionAttendAndExcitePipeline,
         StableDiffusionControlNetPipeline,
+        StableDiffusionControlNetInpaintImg2ImgPipeline,
         StableDiffusionDepth2ImgPipeline,
         StableDiffusionImageVariationPipeline,
         StableDiffusionImg2ImgPipeline,
