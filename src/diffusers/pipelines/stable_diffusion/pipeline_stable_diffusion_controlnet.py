@@ -144,6 +144,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         tokenizer: CLIPTokenizer,
         unet: UNet2DConditionModel,
         controlnet: ControlNetModel,
+        controlnet2: ControlNetModel,
         scheduler: KarrasDiffusionSchedulers,
         safety_checker: StableDiffusionSafetyChecker,
         feature_extractor: CLIPFeatureExtractor,
@@ -173,6 +174,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
             tokenizer=tokenizer,
             unet=unet,
             controlnet=controlnet,
+            controlnet2=controlnet2,
             scheduler=scheduler,
             safety_checker=safety_checker,
             feature_extractor=feature_extractor,
@@ -583,14 +585,11 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         init_latents = torch.cat([init_latents], dim=0)
 
         shape = init_latents.shape
-        print(shape)
         noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
 
         # get latents
         init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
         latents = init_latents
-
-        print(latents.shape)
 
         return latents
 
@@ -640,6 +639,7 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         self,
         prompt: Union[str, List[str]] = None,
         control_image: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]] = None,
+        control_image2: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]] = None,
         init_image: Union[torch.FloatTensor, PIL.Image.Image, List[torch.FloatTensor], List[PIL.Image.Image]] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
@@ -658,7 +658,8 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        controlnet_conditioning_scale: float = 1.0,
+        conditioning: float = 1.0,
+        conditioning2: float = 1.0,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -779,6 +780,15 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
             device,
             self.controlnet.dtype,
         )
+        image2 = self.prepare_image(
+            control_image2,
+            width,
+            height,
+            batch_size * num_images_per_prompt,
+            num_images_per_prompt,
+            device,
+            self.controlnet2.dtype,
+        )
 
         if do_classifier_free_guidance:
             image = torch.cat([image] * 2)
@@ -799,8 +809,6 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
             generator,
             latents,
         )
-        print("asdf3")
-        print(latents.shape)
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -813,21 +821,32 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
-                print("Asdf4")
-                print(latent_model_input.shape)
-                down_block_res_samples, mid_block_res_sample = self.controlnet(
-                    latent_model_input,
-                    t,
-                    encoder_hidden_states=prompt_embeds,
-                    controlnet_cond=image,
-                    return_dict=False,
-                )
-
-                down_block_res_samples = [
-                    down_block_res_sample * controlnet_conditioning_scale
-                    for down_block_res_sample in down_block_res_samples
-                ]
-                mid_block_res_sample *= controlnet_conditioning_scale
+                total_down_block_res_samples = None
+                total_mid_block_res_sample = None
+                for control, img, scale in [[self.controlnet, image, conditioning], [self.controlnet2, image2, conditioning2]]:
+                    down_block_res_samples, mid_block_res_sample = control(
+                        latent_model_input,
+                        t,
+                        encoder_hidden_states=prompt_embeds,
+                        controlnet_cond=img,
+                        return_dict=False,
+                    )
+                    down_block_res_samples = [
+                        down_block_res_sample * scale
+                        for down_block_res_sample in down_block_res_samples
+                    ]
+                    if total_down_block_res_samples is None:
+                        total_down_block_res_samples = down_block_res_samples
+                    else:
+                        total_down_block_res_samples = [
+                            total_down_block_res_samples[i] + down_block_res_samples[i]
+                            for i in range(len(total_down_block_res_samples))
+                        ]
+                    mid_block_res_sample *= scale
+                    if total_mid_block_res_sample is None:
+                        total_mid_block_res_sample = mid_block_res_sample
+                    else:
+                        total_mid_block_res_sample += mid_block_res_sample
 
                 # predict the noise residual
                 noise_pred = self.unet(
@@ -835,8 +854,8 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                     t,
                     encoder_hidden_states=prompt_embeds,
                     cross_attention_kwargs=cross_attention_kwargs,
-                    down_block_additional_residuals=down_block_res_samples,
-                    mid_block_additional_residual=mid_block_res_sample,
+                    down_block_additional_residuals=total_down_block_res_samples,
+                    mid_block_additional_residual=total_mid_block_res_sample,
                 ).sample
 
                 # perform guidance
