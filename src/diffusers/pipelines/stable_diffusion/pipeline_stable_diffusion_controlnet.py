@@ -594,22 +594,22 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         return latents
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_latents
-    # def prepare_latents(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
-    #     shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
-    #     if isinstance(generator, list) and len(generator) != batch_size:
-    #         raise ValueError(
-    #             f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
-    #             f" size of {batch_size}. Make sure the batch size matches the length of the generators."
-    #         )
+    def prepare_latents_base(self, batch_size, num_channels_latents, height, width, dtype, device, generator, latents=None):
+        shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
 
-    #     if latents is None:
-    #         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-    #     else:
-    #         latents = latents.to(device)
+        if latents is None:
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        else:
+            latents = latents.to(device)
 
-    #     # scale the initial noise by the standard deviation required by the scheduler
-    #     latents = latents * self.scheduler.init_noise_sigma
-    #     return latents
+        # scale the initial noise by the standard deviation required by the scheduler
+        latents = latents * self.scheduler.init_noise_sigma
+        return latents
 
     def _default_height_width(self, height, width, image):
         if isinstance(image, list):
@@ -793,22 +793,36 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
         if do_classifier_free_guidance:
             image = torch.cat([image] * 2)
 
-        init_image = preprocess(init_image)
         # 5. set timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
-        latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
-
         # 6. Prepare latent variables
-        latents = self.prepare_latents(
-            init_image,
-            latent_timestep,
-            batch_size,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
+        if init_image:
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
+            timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+            latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
+            init_image = preprocess(init_image)
+            latents = self.prepare_latents(
+                init_image,
+                latent_timestep,
+                batch_size,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                latents,
+            )
+        else:
+            num_channels_latents = self.unet.in_channels
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
+            timesteps = self.scheduler.timesteps
+            latents = self.prepare_latents_base(
+                batch_size * num_images_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                latents,
+            )
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -824,6 +838,8 @@ class StableDiffusionControlNetPipeline(DiffusionPipeline):
                 total_down_block_res_samples = None
                 total_mid_block_res_sample = None
                 for control, img, scale in [[self.controlnet, image, conditioning], [self.controlnet2, image2, conditioning2]]:
+                    if scale == 0:
+                        continue
                     down_block_res_samples, mid_block_res_sample = control(
                         latent_model_input,
                         t,
